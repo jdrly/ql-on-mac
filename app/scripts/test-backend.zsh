@@ -32,7 +32,7 @@ case "$1" in
   reg) echo "$*" >>"$WINEPREFIX/reg.log" ;;
   *SteamSetup.exe) mkdir -p "$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamapps"; : >"$WINEPREFIX/drive_c/Program Files (x86)/Steam/steam.exe" ;;
   *steam.exe)
-    case "$2" in steam://install/*)
+    case "$*" in *steam://install/*)
       printf '"AppState"\n{\n\t"appid"\t\t"282440"\n\t"StateFlags"\t\t"1026"\n\t"BytesToDownload"\t\t"1000"\n\t"BytesDownloaded"\t\t"250"\n}\n' \
         >"$WINEPREFIX/drive_c/Program Files (x86)/Steam/steamapps/appmanifest_282440.acf" ;;
     esac ;;
@@ -84,6 +84,7 @@ ok "install: Retina mode y in the registry" grep -q "RetinaMode /d y" "$S/bottle
 ok "install: Steam installed" test -f "$steam/steam.exe"
 ok "install: Steam started on the game's install page" seen "steam://install/282440" "$S/calls.log"
 seen StateFlags "$steam/steamapps/appmanifest_282440.acf"
+ok "install: Steam starts without its GPU process" seen "steam.exe -cef-disable-gpu steam://install/282440" "$S/calls.log"
 ok "install: Wine got the three defaults" grep -q "GLMT_PRESENT=async WINEMSYNC=1 WINE_GLMT_BATCH=1 WINE_GLMT_FULLSCREEN_SPACE=1" "$S/calls.log"
 out=$(q status)
 ok "status: the game downloads" has "$out" "game=downloading"
@@ -105,10 +106,70 @@ ok "install again: Wine not started (everything was there)" test ! -s "$S/calls.
 out=$(q play)
 ok "play: started" has "$out" "@done started"
 ok "play: 250 fps, vsync off, the display's pixels" seen "-applaunch 282440 +set com_maxfps 250 +set r_swapInterval 0 +set r_fullscreen 1 +set r_mode -1 +set r_customWidth 3840 +set r_customHeight 2160" "$S/calls.log"
+ok "play: Steam starts without its GPU process" seen "steam.exe -cef-disable-gpu -applaunch" "$S/calls.log"
+ok "status: Steam remembers no login yet" has "$(q status)" $'steambg=on\nsteam_login=no'
+# Steam has a login it remembers
+mkdir -p "$steam/config"
+printf '"users"\n{\n\t"7656"\n\t{\n\t\t"AccountName"\t\t"someone"\n\t\t"RememberPassword"\t\t"1"\n\t}\n}\n' >"$steam/config/loginusers.vdf"
+ok "status: Steam remembers a login" has "$(q status)" "steam_login=yes"
+: >"$S/calls.log"; q play >/dev/null
+ok "play: with a remembered login Steam starts without its window" seen "steam.exe -cef-disable-gpu -silent -applaunch 282440" "$S/calls.log"
+q set steambg off >/dev/null; : >"$S/calls.log"; q play >/dev/null
+ok "play: with Steam in the background off its window shows" seen "steam.exe -cef-disable-gpu -applaunch 282440" "$S/calls.log"
+q set steambg on >/dev/null
 ok "play: logs started afresh" test -f "$QLOM_ROOT/logs/wine.log"
+# how far a start is: the note Play leaves, against what Steam and glmt write afterwards
+stage() { q status | sed -n 's/^launch=//p'; }
+logline() { print -r -- "[$1] $2"$'\r'; }
+mkdir -p "$steam/logs"
+ok "start: first Steam is coming up" test "$(stage)" = steam
+ok "start: Steam is there and has not logged on" test "$(QLOM_TEST_RUNNING='session steam' stage)" = signin
+logline "2001-01-01 00:00:00" "[Logged On, 4, 7] [U:1:1] an old session's line" >"$steam/logs/connection_log.txt"
+ok "start: a log-on from before the start does not count" test "$(QLOM_TEST_RUNNING='session steam' stage)" = signin
+logline "2099-01-01 00:00:00" "Downloading update (1,024 of 40,960 KB)..." >"$steam/logs/bootstrap_log.txt"
+ok "start: Steam is updating itself" test "$(QLOM_TEST_RUNNING='session steam' stage)" = steamupdate
+logline "2099-01-01 00:00:05" "Verifying installation..." >>"$steam/logs/bootstrap_log.txt"
+ok "start: and is done with that" test "$(QLOM_TEST_RUNNING='session steam' stage)" = signin
+logline "2099-01-01 00:00:10" "[Logged On, 4, 7] [U:1:1] RecvMsgClientLogOnResponse() : processing complete" >>"$steam/logs/connection_log.txt"
+ok "start: Steam logged on, the game is being started" test "$(QLOM_TEST_RUNNING='session steam' stage)" = game
+logline "2099-01-01 00:00:11" "AppID 282440 state changed : Update Required,Update Queued,Update Running," >"$steam/logs/content_log.txt"
+ok "start: Steam updates the game first" test "$(QLOM_TEST_RUNNING='session steam' stage)" = update
+logline "2099-01-01 00:00:40" "AppID 282440 state changed : Fully Installed,App Running," >>"$steam/logs/content_log.txt"
+ok "start: the update is through" test "$(QLOM_TEST_RUNNING='session steam' stage)" = game
+ok "start: the game's process is there, its picture not yet" test "$(QLOM_TEST_RUNNING='session steam game' stage)" = game
+print -r -- "glmt: Metal device" >"$QLOM_ROOT/logs/glmt.log"
+ok "start: glmt has written, the start is over" test -z "$(QLOM_TEST_RUNNING='session steam game' stage)"
+ok "start: the note is gone with it" test ! -e "$S/.launch"
+rm -f "$steam/logs/"*.txt
+print -r -- "1 warm 2001-01-01 00:00:00" >"$S/.launch"
+ok "start: three minutes and no game is said" test "$(QLOM_TEST_RUNNING='session steam' stage)" = stalled
+ok "start: and only once" test -z "$(QLOM_TEST_RUNNING='session steam' stage)"
+print -r -- "$(( $(date +%s) - 300 )) cold 2001-01-01 00:00:00" >"$S/.launch"
+mv "$steam/config/loginusers.vdf" "$steam/config/loginusers.vdf.away"
+ok "start: a sign-in by hand gets longer than three minutes" test "$(QLOM_TEST_RUNNING='session steam' stage)" = signin
+mv "$steam/config/loginusers.vdf.away" "$steam/config/loginusers.vdf"
+print -r -- "1 cold 2001-01-01 00:00:00" >"$S/.launch"
+ok "start: a session that ended without the game is said to have failed" test "$(stage)" = failed
+ok "start: and only once" test -z "$(stage)"
+q play >/dev/null
+ok "play: a Steam that already runs is not waited for" test "$(QLOM_TEST_RUNNING='session steam' q play >/dev/null; QLOM_TEST_RUNNING='session steam' stage)" = game
+ok "play: a session without Steam still has its sign-in ahead" test "$(QLOM_TEST_RUNNING='session' q play >/dev/null; QLOM_TEST_RUNNING='session steam' stage)" = signin
+logline "2099-01-01 00:00:10" "[Logged On, 4, 7] [U:1:1] RecvMsgClientLogOnResponse() : processing complete" >"$steam/logs/connection_log.txt"
+logline "2099-01-01 00:05:00" "Downloading update (1,024 of 40,960 KB)..." >"$steam/logs/bootstrap_log.txt"
+ok "start: Steam's background update after its log-on is not this start's" test "$(QLOM_TEST_RUNNING='session steam' stage)" = game
+rm -f "$steam/logs/"*.txt
+q stop >/dev/null
+ok "stop: ends a start that was under way" test ! -e "$S/.launch"
+sed -i.bak 's/"StateFlags"\([^"]*\)"4"/"StateFlags"\1"1092"/' "$steam/steamapps/appmanifest_282440.acf"
+ok "status: the game counts as installed while it runs with an update waiting" has "$(q status)" "game=ok"
+sed -i.bak 's/"StateFlags"\([^"]*\)"1092"/"StateFlags"\1"4"/' "$steam/steamapps/appmanifest_282440.acf"
 
 ok "set fps 125" has "$(q set fps 125)" "@done"
 ok "set retina off" has "$(q set retina off)" "@done"
+ok "status: Steam quits with the game by default" has "$(q status)" "quitsteam=on"
+ok "set quitsteam off" has "$(q set quitsteam off)" "@done"
+ok "status: quitsteam off" has "$(q status)" "quitsteam=off"
+ok "stop: done (no session runs here, so nothing is asked of Steam)" has "$(q stop)" "@done"
 ok "set: a value that is not offered is refused" has "$(q set fps 144 || true)" "@error"
 ok "set: a key that is not offered is refused" has "$(q set hud on || true)" "@error"
 out=$(q status)

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The app under the hardened runtime (Developer ID builds, app/scripts/release.zsh). It needs no
+     exceptions: it only runs /bin/zsh with Resources/qlom.zsh, which downloads and runs Wine as
+     separate processes. -->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

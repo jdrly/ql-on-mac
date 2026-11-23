@@ -11,6 +11,8 @@ OpenGL-on-Vulkan-on-Metal stack in between.
 
 On my Mac the game now holds its own cap of 250 fps at 3840x2160.
 
+![Quake Live at 3840x2160 on an M5 Max, with Metal's HUD reading 250 fps and a 4.00 ms frame interval](docs/images/quake-live.jpg)
+
 > QL on Mac is an unofficial fan project. id Software and Bethesda don't make, endorse or support
 > it. It doesn't host or change the game. Steam comes from Valve and Quake Live comes from Steam.
 > Quake Live is a trademark of id Software LLC, Steam of Valve Corporation, Mac of Apple Inc.
@@ -32,12 +34,28 @@ Nobody else has run it yet. Expect rough edges, and read
   [GW2 on Mac](https://github.com/jdrly/gw2-on-mac), uses, and there it needs macOS 26.5 or later.
   I have only run Quake Live on macOS 27.
 - Quake Live on your Steam account.
-- Xcode's command line tools and [Homebrew](https://brew.sh) with `bison`, `freetype` and
-  `pkgconf`. The setup
-  compiles glmt and two of Wine's libraries on your Mac.
-- About 12 GB of free space for the engine, the compiler, Wine's build and the game.
+- About 5 GB of free space for the engine, Steam and the game.
 
 ## Install and play
+
+Download `QL-on-Mac-0.1.0.dmg` from the
+[latest release](https://github.com/jdrly/ql-on-mac/releases/latest), open it and drag QL on Mac
+to Applications. The app is signed with my Developer ID and notarized by Apple.
+
+<img src="docs/images/app.png" width="506" alt="QL on Mac's window: Play, the frame cap, Retina, Steam in the background, Quit Steam with the game, Automatic updates">
+
+Install downloads the Wine engine, makes a bottle and runs Valve's Steam installer. Then Steam
+opens. You sign in there and install Quake Live. After that the window has Play. The button says
+how far the start is while Steam comes up, signs in and launches the game.
+
+The app keeps everything in `~/Library/Application Support/QL on Mac`. More, then Uninstall,
+removes it. [`app/README.md`](app/README.md) has the details.
+
+### From the scripts
+
+The scripts do the same from a checkout and compile everything on your Mac. They need Xcode's
+command line tools, [Homebrew](https://brew.sh) with `bison`, `freetype` and `pkgconf`, and about
+12 GB of free space for the engine, the compiler, Wine's build and the game.
 
 ```sh
 git clone https://github.com/jdrly/ql-on-mac
@@ -58,12 +76,10 @@ Everything lands in `work/` inside the checkout. Deleting that folder removes al
 installed and running, `debug` starts the game with logs in the terminal, and the script's header
 lists the rest.
 
-There is also a small app in [`app/`](app/README.md), one window with Install, Play and three
-settings. It is new. I have not shipped a build of it, and the scripts are what I play with.
+### Settings for the scripts
 
-### Settings
-
-They are environment variables in front of `scripts/ql.zsh play`.
+The app has its own switches. For the scripts they are environment variables in front of
+`scripts/ql.zsh play`.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -141,7 +157,8 @@ Steam Cloud carries the trimmed config to your other computers.
 | `glmt/` | The translator. It also has a repository of its own, [jdrly/glmt](https://github.com/jdrly/glmt), with the same code. `make -C glmt test` runs its tests on any system. `make -C glmt` builds `libglmt.dylib` on macOS. |
 | `patches/wine/` | Four patches to Wine at the engine's commit. The build takes Wine's source from [my fork](https://github.com/jdrly/wine), which has that commit. |
 | `scripts/` | Setup, play and the builds on the Mac. `scripts/ql.zsh` is the one command. |
-| `app/` | The launcher app. |
+| `app/` | The app, its build and its release script. |
+| `docs/images/` | The pictures in this file. |
 | `ci/`, `.github/workflows/` | The build of Wine's patched libraries, used on the Mac and by CI. |
 
 ## Licence

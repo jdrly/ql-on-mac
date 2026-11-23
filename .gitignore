@@ -5,6 +5,7 @@
 /app/prebuilt/
 /app/dist/
 /app/.cache/
+/app/release/
 
 # an agent's notes about the checkout it works in are not part of the project
 AGENTS.md

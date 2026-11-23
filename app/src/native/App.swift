@@ -26,6 +26,12 @@ enum Phase: Equatable {
   case ready
 }
 
+// A start of the game that did not get there
+enum LaunchProblem: Equatable {
+  case failed    // the session ended before the game came
+  case stalled   // Steam runs, and after minutes there is still no game
+}
+
 @MainActor
 final class Model: ObservableObject {
   struct Progress: Equatable {
@@ -42,6 +48,10 @@ final class Model: ObservableObject {
   @Published var playError: String?
   @Published var launching = false
   @Published var settingBusy = false
+  @Published var stopping = false         // Steam is being quit (by More, by the game's end or by the app's)
+  @Published var launchProblem: LaunchProblem?
+
+  static let shared = Model()
 
   static let installSteps = [
     Step(id: 1, title: "Wine, to run Windows programs", detail: "126 MB download"),
@@ -57,6 +67,8 @@ final class Model: ObservableObject {
   private var lastError: String?          // the running operation's last "@error" line
   private var timer: Timer?
   private var refreshing = false
+  private var ticks = 0
+  private var startAsked: Date?           // Play was just answered; the next status may predate it
 
   init(resources: URL = Bundle.main.resourceURL ?? URL(fileURLWithPath: "/")) {
     script = resources.appendingPathComponent("qlom.zsh")
@@ -65,7 +77,8 @@ final class Model: ObservableObject {
 
   // A fixed state for the headless render (Render.swift): no backend, no timer
   init(previewStatus: [String: String], operation: Operation? = nil, stepIndex: Int = 0,
-       progress: Progress? = nil, failure: String? = nil, playError: String? = nil) {
+       progress: Progress? = nil, failure: String? = nil, playError: String? = nil,
+       launchProblem: LaunchProblem? = nil) {
     script = URL(fileURLWithPath: "/dev/null")
     preview = true
     status = previewStatus
@@ -75,6 +88,7 @@ final class Model: ObservableObject {
     self.progress = progress
     self.failure = failure
     self.playError = playError
+    self.launchProblem = launchProblem
   }
 
   // MARK: What the window asks
@@ -83,7 +97,8 @@ final class Model: ObservableObject {
     if operation == .install || operation == .repair || failure != nil { return .working }
     if !loaded { return .loading }
     let base = status["engine"] == "ok" && status["bottle"] == "ok" && status["steam"] == "ok"
-    if base && status["game"] == "ok" { return .ready }
+    // a start that is under way stays on Play's screen, also while Steam updates the game first
+    if base && (status["game"] == "ok" || starting) { return .ready }
     if base { return .waitingForGame }
     return .setup
   }
@@ -94,8 +109,20 @@ final class Model: ObservableObject {
 
   var sessionRunning: Bool { status["session"] == "running" }
   var gameRunning: Bool { status["game_running"] == "yes" }
+  // How far a start of the game is, by the backend: steam, steamupdate, signin, update, game.
+  // Empty when none is under way.
+  var launchStage: String {
+    let stage = status["launch"] ?? ""
+    return stage == "failed" || stage == "stalled" ? "" : stage
+  }
+  var starting: Bool { !launchStage.isEmpty }
   var fps: Int { Int(status["fps"] ?? "") ?? 250 }
   var retina: Bool { status["retina"] != "off" }
+  var quitSteamWithGame: Bool { status["quitsteam"] != "off" }
+  var steamInBackground: Bool { status["steambg"] != "off" }
+  // Steam has a login it uses by itself: only then can it start without its window
+  var steamSignedIn: Bool { status["steam_login"] == "yes" }
+  var isPreview: Bool { preview }
   // the display is one macOS scales: without that, Retina mode changes nothing
   var displayScaled: Bool {
     guard let pixels = status["display_pixels"], let points = status["display_points"], !pixels.isEmpty else { return true }
@@ -124,8 +151,16 @@ final class Model: ObservableObject {
   func start() {
     guard !preview else { return }
     refresh()
-    timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-      Task { @MainActor in self?.refresh() }
+    // Every two seconds; every second while the game is being started, so that its stages show;
+    // every ten while the game draws: a status is a handful of short processes, and a program
+    // that wakes up on a timer beside the game is what cost it frames before.
+    timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+      Task { @MainActor in
+        guard let self else { return }
+        self.ticks += 1
+        let every = self.starting || self.launching ? 1 : self.gameRunning ? 10 : 2
+        if self.ticks % every == 0 { self.refresh() }
+      }
     }
   }
 
@@ -143,8 +178,22 @@ final class Model: ObservableObject {
       }
       refreshing = false
       if !values.isEmpty {
+        // a status that was on its way while Play ran does not know of the start yet
+        if (values["launch"] ?? "").isEmpty, values["game_running"] != "yes", let asked = startAsked,
+           Date().timeIntervalSince(asked) < 3 {
+          values["launch"] = "steam"
+        }
+        let gameWasRunning = gameRunning
         status = values
         loaded = true
+        // the backend says once that a start did not get to the game
+        switch values["launch"] {
+        case "failed": launchProblem = .failed
+        case "stalled": launchProblem = .stalled
+        default: if gameRunning { launchProblem = nil }
+        }
+        // the game has quit while the app watched: Steam goes too, if that is wanted
+        if gameWasRunning && !gameRunning && sessionRunning && quitSteamWithGame { quitSteam() }
       }
     }
   }
@@ -282,9 +331,16 @@ final class Model: ObservableObject {
     guard !launching else { return }
     launching = true
     playError = nil
+    launchProblem = nil
     command(["play"]) { [weak self] error in
-      self?.launching = false
-      self?.playError = error
+      guard let self else { return }
+      self.launching = false
+      self.playError = error
+      // until the next status says where the start is, so that the button does not flash "Play"
+      if error == nil && !self.gameRunning && self.status["launch", default: ""].isEmpty {
+        self.startAsked = Date()
+        self.status["launch"] = "steam"
+      }
     }
   }
 
@@ -292,14 +348,21 @@ final class Model: ObservableObject {
     guard !launching else { return }
     launching = true
     playError = nil
+    launchProblem = nil
     command(["steam"]) { [weak self] error in
       self?.launching = false
       self?.playError = error
     }
   }
 
-  func quitSteam() {
-    command(["stop"])
+  func quitSteam(then: @escaping () -> Void = {}) {
+    guard !stopping else { then(); return }
+    stopping = true
+    launchProblem = nil
+    command(["stop"]) { [weak self] _ in
+      self?.stopping = false
+      then()
+    }
   }
 
   func set(_ key: String, _ value: String) {
@@ -359,11 +422,34 @@ final class LineReader: @unchecked Sendable {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+  // Quitting the app quits Steam, and the game with it. It asks first when that would end a game
+  // or stop Steam's download of it; an idle Steam just goes.
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    let model = Model.shared
+    // a start that was just asked for counts as a session: the status may not show it yet
+    guard !model.isPreview, model.sessionRunning || model.operation != nil || model.launching || model.starting else { return .terminateNow }
+    let downloading = model.phase == .waitingForGame && model.gameDownload != nil
+    if model.gameRunning || downloading {
+      let alert = NSAlert()
+      alert.alertStyle = .warning
+      alert.messageText = model.gameRunning ? "Quit Quake Live and Steam?" : "Quit Steam?"
+      alert.informativeText = model.gameRunning
+        ? "Quake Live is running. Quitting \(appName) ends the game and Steam."
+        : "Steam is downloading Quake Live. It picks the download up again the next time it starts."
+      alert.addButton(withTitle: model.gameRunning ? "Quit Both" : "Quit Steam")
+      alert.addButton(withTitle: "Cancel")
+      if alert.runModal() != .alertFirstButtonReturn { return .terminateCancel }
+    }
+    model.cancel()
+    model.quitSteam { NSApp.reply(toApplicationShouldTerminate: true) }
+    return .terminateLater
+  }
 }
 
 struct QLonMacApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-  @StateObject private var model = Model()
+  @ObservedObject private var model = Model.shared
   @StateObject private var updates = Updates()
 
   var body: some Scene {

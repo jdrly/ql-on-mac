@@ -171,9 +171,9 @@ struct WaitingView: View {
           Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
         }
       }
-      Button(model.sessionRunning ? "Show Steam" : "Open Steam") { model.showSteam() }
+      Button(model.stopping ? "Quitting Steam…" : model.sessionRunning ? "Show Steam" : "Open Steam") { model.showSteam() }
         .buttonStyle(PrimaryButtonStyle())
-        .disabled(model.launching)
+        .disabled(model.launching || model.stopping)
     }
   }
 }
@@ -187,12 +187,44 @@ struct ReadyView: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 28) {
       VStack(alignment: .leading, spacing: 8) {
-        Button(model.gameRunning ? "Quake Live Is Running" : model.launching ? "Starting…" : "Play") { model.play() }
-          .buttonStyle(PrimaryButtonStyle())
-          .disabled(model.gameRunning || model.launching)
-          .keyboardShortcut(.defaultAction)
+        Button { model.play() } label: {
+          HStack(spacing: 8) {
+            if busy {
+              // a light spinner on the button's grey, in both appearances
+              ProgressView().controlSize(.small).colorScheme(.dark)
+            }
+            Text(playLabel)
+          }
+        }
+        .buttonStyle(PrimaryButtonStyle())
+        .disabled(model.gameRunning || busy)
+        .keyboardShortcut(.defaultAction)
+        if model.launchStage == "update", let download = model.gameDownload {
+          ProgressView(value: Double(download.done), total: Double(download.total))
+          Text("\(megabytes(download.done)) of \(megabytes(download.total)) MB")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+        } else if model.launchStage == "signin" && !model.steamSignedIn {
+          Text("Sign in to Steam in its window. The game starts after that.")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
         if let error = model.playError {
           Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+        } else if let problem = model.launchProblem {
+          HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(problem == .failed ? "Steam quit before Quake Live started." : "Quake Live hasn't started. Steam may be waiting for you.")
+              .font(.callout)
+              .foregroundStyle(.red)
+              .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            if problem == .failed {
+              Button("Show Logs") { model.showLogs() }.fixedSize()
+            } else {
+              Button("Show Steam") { model.showSteam() }.fixedSize()
+            }
+          }
         }
       }
       VStack(alignment: .leading, spacing: 18) {
@@ -217,6 +249,18 @@ struct ReadyView: View {
               .disabled(!model.displayScaled)
           }
         }
+        if model.steamSignedIn {
+          SettingRow(label: "Steam in the background") {
+            Toggle("Steam in the background", isOn: Binding(get: { model.steamInBackground }, set: { model.set("steambg", $0 ? "on" : "off") }))
+              .toggleStyle(.switch)
+              .labelsHidden()
+          }
+        }
+        SettingRow(label: "Quit Steam with the game") {
+          Toggle("Quit Steam with the game", isOn: Binding(get: { model.quitSteamWithGame }, set: { model.set("quitsteam", $0 ? "on" : "off") }))
+            .toggleStyle(.switch)
+            .labelsHidden()
+        }
         SettingRow(label: "Automatic updates", value: "Version \(updates.version)", hint: updates.available ? nil : "This build has no update feed.") {
           HStack(spacing: 12) {
             Button("Check Now") { updates.check() }
@@ -230,6 +274,25 @@ struct ReadyView: View {
         }
       }
     }
+  }
+
+  // Play is on its way: the command runs, or Steam is somewhere between starting and the game
+  private var busy: Bool { model.stopping || model.launching || model.starting }
+
+  // The button says where a start is: with Steam in the background there is nothing else to see
+  // for the half minute Steam takes to come up and sign in
+  private var playLabel: String {
+    if model.stopping { return "Quitting Steam…" }
+    switch model.launchStage {
+    case "steam": return "Starting Steam…"
+    case "steamupdate": return "Steam Is Updating Itself…"
+    case "signin": return model.steamSignedIn ? "Signing In to Steam…" : "Waiting for Your Steam Sign-In…"
+    case "update": return "Steam Is Updating Quake Live…"
+    case "game": return "Starting Quake Live…"
+    default: break
+    }
+    if model.gameRunning { return "Quake Live Is Running" }
+    return model.launching ? "Starting…" : "Play"
   }
 
   private var retinaHint: String? {
@@ -281,6 +344,7 @@ struct Footer: View {
           Button(model.sessionRunning ? "Show Steam" : "Open Steam") { model.showSteam() }
           if model.sessionRunning {
             Button("Quit Steam") { model.quitSteam() }
+              .disabled(model.stopping)
           }
           Button("Show Logs") { model.showLogs() }
           Divider()

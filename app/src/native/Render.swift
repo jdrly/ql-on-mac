@@ -14,7 +14,7 @@ enum Render {
 
     let display = ["display_pixels": "3840x2160", "display_points": "1920x1080"]
     let installed = display.merging(["engine": "ok", "components": "ok", "bottle": "ok", "steam": "ok"]) { $1 }
-    let ready = installed.merging(["game": "ok", "fps": "250", "retina": "on", "retina_applied": "on", "session": "none", "game_running": "no"]) { $1 }
+    let ready = installed.merging(["game": "ok", "fps": "250", "retina": "on", "retina_applied": "on", "session": "none", "game_running": "no", "steam_login": "yes"]) { $1 }
     let noFeed = Updates(previewVersion: "0.1.0", available: false, automatic: false)
     let withFeed = Updates(previewVersion: "0.1.0", available: true, automatic: true)
 
@@ -26,9 +26,15 @@ enum Render {
                                   failure: "Steam's installer could not be downloaded from Valve."), noFeed),
       ("4-waiting", Model(previewStatus: installed.merging(["game": "downloading", "game_bytes": "412000000", "game_total": "1130000000", "session": "running"]) { $1 }), noFeed),
       ("5-ready", Model(previewStatus: ready), withFeed),
-      ("6-ready-no-feed", Model(previewStatus: ready.merging(["fps": "125"]) { $1 }), noFeed),
+      ("6-ready-no-feed-no-login", Model(previewStatus: ready.merging(["fps": "125", "steam_login": "no"]) { $1 }), noFeed),
       ("7-ready-running-retina-waits", Model(previewStatus: ready.merging(["retina": "off", "session": "running", "game_running": "yes"]) { $1 }), withFeed),
       ("8-ready-display-not-scaled", Model(previewStatus: ready.merging(["display_points": "3840x2160"]) { $1 }), withFeed),
+      ("10-starting-signing-in", Model(previewStatus: ready.merging(["session": "running", "launch": "signin"]) { $1 }), withFeed),
+      ("11-starting-sign-in-by-hand", Model(previewStatus: ready.merging(["session": "running", "launch": "signin", "steam_login": "no"]) { $1 }), withFeed),
+      ("12-starting-game-update", Model(previewStatus: ready.merging(["session": "running", "launch": "update", "game": "downloading", "game_bytes": "31000000", "game_total": "118000000"]) { $1 }), withFeed),
+      ("13-starting-game", Model(previewStatus: ready.merging(["session": "running", "launch": "game", "game_running": "yes"]) { $1 }), withFeed),
+      ("14-start-stalled", Model(previewStatus: ready.merging(["session": "running"]) { $1 }, launchProblem: .stalled), withFeed),
+      ("15-start-failed", Model(previewStatus: ready, launchProblem: .failed), withFeed),
       ("9-ready-play-error", Model(previewStatus: ready, playError: "Quit Steam first: this version's files go into the engine before the game starts."), withFeed),
     ]
     for (name, model, updates) in states {
