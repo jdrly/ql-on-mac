@@ -1,8 +1,9 @@
 # QL on Mac (the app)
 
 One window that sets Quake Live up on this Mac and starts it: its own Wine engine with glmt,
-its own bottle, Steam from Valve, the game through Steam. It follows GW2 on Mac's app
-(`jdrly/gw2-on-mac`: a SwiftUI window over a shell backend in the bundle, Sparkle for updates)
+its own bottle, Steam from Valve, the game through Steam. It follows
+[GW2 on Mac](https://github.com/jdrly/gw2-on-mac)'s app (a SwiftUI window over a shell backend in
+the bundle, [Sparkle](https://github.com/sparkle-project/Sparkle) for updates)
 and is cut down to what fits on one screen.
 
 Status (2026-11-23): written. The backend is tested in a sandbox on Linux (57 checks, a
@@ -84,15 +85,11 @@ session to be seen, `codesign`, the display's size, and the window.
 
 ## Before anyone else gets it
 
-Three things are open; none blocks building it or using it on the Mac it was built on:
+Two things are open; neither blocks building it or using it on the Mac it was built on:
 
 - **An update feed.** Sparkle needs a public address for `appcast.xml` and the DMG: a GitHub
   release, once there is one.
 - **Signing.** A Developer ID signature and notarization (GW2 on Mac's `release.sh` does both).
   The engine's files are re-signed ad hoc when they go in, as the scripts do.
-- **The batching DLL.** `opengl32.dll` is new 32-bit code in the game's process. I don't know
-  what anti-cheat the game runs (its Steam page doesn't list VAC). I took that risk for my own
-  account, and a player who installs the app takes it for theirs: the app has to say so before
-  it installs the pair.
 
 Also open: an icon (the bundle has none), a first real install, and Retina off.

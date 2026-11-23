@@ -1,14 +1,18 @@
 # glmt
 
 glmt is OpenGL 1.x on Metal, for one family of games. It implements the calls id Tech 3 makes,
-the engine under Quake III Arena and Quake Live, and it runs inside Wine on an Apple silicon Mac.
+the engine under Quake III Arena and Quake Live, and it runs inside
+[Wine](https://gitlab.winehq.org/wine/wine) on an Apple silicon Mac.
 Wine's Mac driver loads `libglmt.dylib` and hands the game its entry points in place of Apple's
 OpenGL.
 
-I wrote it because nothing existing fit. ANGLE and MetalANGLE translate OpenGL ES. MGL covers
-modern core OpenGL and has no fixed-function pipeline. Apple's own OpenGL gives a GL 1.x game its
-legacy 2.1 driver, where Quake Live ran at 60 to 70 fps with stutter on my M5 Max. Mesa's Zink
-would work, but it stacks OpenGL on Vulkan on Metal, and I wanted one translation, not three.
+I wrote it because nothing existing fit. [ANGLE](https://github.com/google/angle) and
+[MetalANGLE](https://github.com/kakashidinho/metalangle) translate OpenGL ES.
+[MGL](https://github.com/openglonmetal/MGL) covers modern core OpenGL and has no fixed-function
+pipeline. Apple's own OpenGL gives a GL 1.x game its
+legacy 2.1 driver, where Quake Live ran at 60 to 70 fps with stutter on my M5 Max. [Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s
+[Zink](https://docs.mesa3d.org/drivers/zink.html) would work, but it stacks OpenGL on Vulkan on
+Metal, and I wanted one translation, not three.
 
 With glmt the same game holds 250 fps at 3840x2160 on that Mac.
 
@@ -61,7 +65,8 @@ record and compare them.
 
 ### What id Tech 3 does, and what glmt does with it
 
-I read this in id's GPL source of Quake III Arena. Quake Live's renderer is a closed descendant
+I read this in id's GPL source of
+[Quake III Arena](https://github.com/id-Software/Quake-III-Arena). Quake Live's renderer is a closed descendant
 and may differ.
 
 The engine sets positions once per surface and locks them with `glLockArraysEXT`. Each shader
@@ -128,7 +133,7 @@ scene there.
 ## Using it in Wine
 
 glmt has no window system code. The host gives it a `CAMetalLayer` and asks for entry points by
-name. In QL on Mac the host is Wine's Mac driver with
+name. In [QL on Mac](../README.md) the host is Wine's Mac driver with
 [`patches/wine/0001-winemac-glmt.patch`](../patches/wine/0001-winemac-glmt.patch), which loads
 the library for `quakelive_steam.exe`, or for the programs `WINE_GLMT_EXE` names.
 
