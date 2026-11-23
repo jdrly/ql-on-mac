@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] opengl32: Hand the OpenGL calls of glmt's program over in
+ batches.
+
+A 32-bit program's every OpenGL call is a crossing into the 64-bit unix side. With
+WINE_GLMT_BATCH=1, for glmt's program only, the PE side keeps the calls that only set state in a
+buffer of the thread's own and hands them over together with the next call that cannot wait (a
+draw, anything that returns a value or touches memory): one new unix call, gl_batch, the last in
+the table, runs them in order through the same thunks. Every unix call of the DLL goes through
+gl_unix_call, so nothing overtakes a batch. Off unless the environment asks for it.
+---
+ dlls/opengl32/unix_private.h |   4 ++
+ dlls/opengl32/unix_thunks.c  |   2 +
+ dlls/opengl32/unix_wgl.c     | 105 +++++++++++++++++++++++++++++
+ dlls/opengl32/unixlib.h      |  28 ++++++++
+ dlls/opengl32/wgl.c          | 126 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 265 insertions(+)
+
+diff --git a/dlls/opengl32/unix_private.h b/dlls/opengl32/unix_private.h
+index a5b82cc2498..23aa6cbd35b 100644
+--- a/dlls/opengl32/unix_private.h
++++ b/dlls/opengl32/unix_private.h
+@@ -89,6 +89,10 @@ extern NTSTATUS process_attach( void *args );
+ extern NTSTATUS thread_attach( void *args );
+ extern NTSTATUS process_detach( void *args );
+ extern NTSTATUS thread_detach( void *args );
++extern NTSTATUS gl_batch( void *args );
++#ifdef _WIN64
++extern NTSTATUS wow64_gl_batch( void *args );
++#endif
+ extern NTSTATUS set_root_context( void *args );
+ extern NTSTATUS get_pixel_formats( void *args );
+ extern void set_current_fbo( TEB *teb, GLenum target, GLuint framebuffer );
+diff --git a/dlls/opengl32/unix_thunks.c b/dlls/opengl32/unix_thunks.c
+index 0ff25c66037..94e7adc7207 100644
+--- a/dlls/opengl32/unix_thunks.c
++++ b/dlls/opengl32/unix_thunks.c
+@@ -31023,6 +31023,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     ext_wglSetPbufferAttribARB,
+     ext_wglSetPixelFormatWINE,
+     ext_wglSwapIntervalEXT,
++    gl_batch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -84675,6 +84676,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     wow64_ext_wglSetPbufferAttribARB,
+     wow64_ext_wglSetPixelFormatWINE,
+     wow64_ext_wglSwapIntervalEXT,
++    wow64_gl_batch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+index 26136a0dd5b..7d982be25b0 100644
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -26,6 +26,8 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
+ #include <assert.h>
+ 
+ #include <pthread.h>
+@@ -1249,6 +1251,84 @@ NTSTATUS get_pixel_formats( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++/* (ql-on-mac) Batching: see struct gl_batch_params in unixlib.h. */
++
++/* Whether this process batches: WINE_GLMT_BATCH=1 in the environment, and the program is glmt's
++   (Quake Live, or what WINE_GLMT_EXE names; WINE_GLMT=1 every program, =0 none), by the rule
++   of winemac.drv's macdrv_glmt_wanted. Other programs keep one unix call per OpenGL call. */
++static BOOL gl_batch_wanted(void)
++{
++    const char *value = getenv( "WINE_GLMT_BATCH" ), *all = getenv( "WINE_GLMT" ), *list = getenv( "WINE_GLMT_EXE" );
++    const WCHAR *appname, *p;
++    char name[MAX_PATH];
++    size_t len, i;
++
++    if (!value || strcmp( value, "1" )) return FALSE;
++    if (all && !strcmp( all, "0" )) return FALSE;
++    if (all && !strcmp( all, "1" )) return TRUE;
++    if (!list || !*list) list = "quakelive_steam.exe";
++
++    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    for (p = appname; *p; p++) if (*p == '/' || *p == '\\') appname = p + 1;
++    for (len = 0; appname[len] && len < sizeof(name) - 1; len++)
++        name[len] = appname[len] < 0x80 ? (appname[len] >= 'A' && appname[len] <= 'Z' ? appname[len] + 32 : (char)appname[len]) : '?';
++    name[len] = 0;
++    if (!len) return FALSE;
++
++    while (*list)
++    {
++        const char *end = strchr( list, ',' );
++        size_t item = end ? (size_t)(end - list) : strlen( list );
++
++        if (item == len)
++        {
++            for (i = 0; i < len; i++)
++            {
++                char ch = list[i] >= 'A' && list[i] <= 'Z' ? list[i] + 32 : list[i];
++                if (ch != name[i]) break;
++            }
++            if (i == len) return TRUE;
++        }
++        if (!end) break;
++        list = end + 1;
++    }
++    return FALSE;
++}
++
++/* Runs the entries of a batch in order through `funcs`, the table the calls would have come
++   through one by one. An entry that is not a plain OpenGL call ends the batch: the PE side puts
++   none there, and what follows it would be read at a wrong offset. */
++static void run_gl_batch( const unixlib_entry_t *funcs, char *ptr, UINT used )
++{
++    char *end = ptr + used;
++
++    while (end - ptr >= (ptrdiff_t)sizeof(struct gl_batch_entry))
++    {
++        struct gl_batch_entry *entry = (struct gl_batch_entry *)ptr;
++        UINT size = (entry->size + 7) & ~7u;
++
++        if (entry->code >= unix_gl_batch || !entry->size || size > (UINT)(end - ptr) - sizeof(*entry)) break;
++        funcs[entry->code]( entry + 1 );
++        ptr += sizeof(*entry) + size;
++    }
++}
++
++NTSTATUS gl_batch( void *args )
++{
++    struct gl_batch_params *params = args;
++
++    if (params->query)
++    {
++        /* (on stderr whatever WINEDEBUG says: a session's log has to tell whether it was on) */
++        if ((params->enabled = gl_batch_wanted()))
++            fprintf( stderr, "opengl32: this process hands its OpenGL calls over in batches (WINE_GLMT_BATCH)\n" );
++        return STATUS_SUCCESS;
++    }
++    run_gl_batch( __wine_unix_call_funcs, params->buffer, params->used );
++    if (params->final_code < unix_gl_batch) return __wine_unix_call_funcs[params->final_code]( params->final_params );
++    return STATUS_SUCCESS;
++}
++
+ #ifdef _WIN64
+ 
+ static pthread_mutex_t wgl_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -2042,4 +2122,29 @@ NTSTATUS wow64_get_pixel_formats( void *args )
+     return status;
+ }
+ 
++NTSTATUS wow64_gl_batch( void *args )
++{
++    struct
++    {
++        PTR32 buffer;
++        UINT  used;
++        UINT  final_code;
++        PTR32 final_params;
++        UINT  query;
++        UINT  enabled;
++    } *params = args;
++
++    if (params->query)
++    {
++        /* (on stderr whatever WINEDEBUG says: a session's log has to tell whether it was on) */
++        if ((params->enabled = gl_batch_wanted()))
++            fprintf( stderr, "opengl32: this process hands its OpenGL calls over in batches (WINE_GLMT_BATCH)\n" );
++        return STATUS_SUCCESS;
++    }
++    run_gl_batch( __wine_unix_call_wow64_funcs, ULongToPtr( params->buffer ), params->used );
++    if (params->final_code < unix_gl_batch)
++        return __wine_unix_call_wow64_funcs[params->final_code]( ULongToPtr( params->final_params ) );
++    return STATUS_SUCCESS;
++}
++
+ #endif
+diff --git a/dlls/opengl32/unixlib.h b/dlls/opengl32/unixlib.h
+index a17c3d7c140..8c417a58259 100644
+--- a/dlls/opengl32/unixlib.h
++++ b/dlls/opengl32/unixlib.h
+@@ -28880,6 +28880,7 @@ enum unix_funcs
+     unix_wglSetPbufferAttribARB,
+     unix_wglSetPixelFormatWINE,
+     unix_wglSwapIntervalEXT,
++    unix_gl_batch, /* (ql-on-mac) the last one: an unpatched opengl32.dll never calls it */
+     funcs_count
+ };
+ 
+@@ -28896,6 +28897,33 @@ struct gl_debug_message_callback_params
+     char message[1];
+ };
+ 
++/* (ql-on-mac) Batching, for a 32-bit program whose every OpenGL call is a crossing into the
++   64-bit unix side: the PE side keeps the calls that only set state in a buffer of the
++   thread's own and hands them over together with the next call that cannot wait (a draw,
++   anything that returns a value or touches memory). Each entry is a struct gl_batch_entry
++   followed by the call's own params struct, as UNIX_CALL would have passed it, padded to
++   8 bytes; the unix side runs the entries in order through the same thunks. */
++struct gl_batch_entry
++{
++    UINT code; /* enum unix_funcs */
++    UINT size; /* of the params that follow, before padding */
++};
++
++struct gl_batch_params
++{
++    void *buffer;       /* the entries */
++    UINT  used;         /* their bytes */
++    UINT  final_code;   /* a call to make after them, funcs_count: none */
++    void *final_params;
++    UINT  query;        /* only say whether this process batches (enabled) */
++    UINT  enabled;
++};
++
++#ifdef WINE_UNIX_LIB
+ #define UNIX_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
++#else
++extern NTSTATUS gl_unix_call( unsigned int code, void *params );
++#define UNIX_CALL( func, params ) gl_unix_call( unix_ ## func, params )
++#endif
+ 
+ #endif /* __WINE_OPENGL32_UNIXLIB_H */
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index 63aa6d3dbeb..4280646ca2c 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -3275,6 +3275,125 @@ static NTSTATUS WINAPI call_gl_debug_message_callback( void *args, ULONG size )
+     return STATUS_SUCCESS;
+ }
+ 
++/* (ql-on-mac) Batching: see struct gl_batch_params in unixlib.h.
++
++   What may wait: calls without a result that touch no memory when they are made. A pointer
++   an array call takes is only kept by OpenGL and read at the draw, and the draw is not in this
++   list: it hands the batch over first and runs in the same crossing, so the order of the calls
++   is what the program made, and so is the memory they read. Every unix call of this DLL goes
++   through gl_unix_call (UNIX_CALL), so nothing overtakes a batch: not a draw, not a query, not
++   wglSwapBuffers or wglMakeCurrent. */
++#define GL_BATCH_BYTES 0x8000
++
++struct gl_batch
++{
++    UINT used;  /* bytes of data */
++    BOOL busy;  /* being handed over: a callback from the unix side makes its calls directly */
++    char DECLSPEC_ALIGN(8) data[GL_BATCH_BYTES];
++};
++
++/* the size of the params of every call that may wait, 0 for all others */
++static const unsigned char gl_batch_sizes[funcs_count] =
++{
++    [unix_glEnable] = sizeof(struct glEnable_params),
++    [unix_glDisable] = sizeof(struct glDisable_params),
++    [unix_glEnableClientState] = sizeof(struct glEnableClientState_params),
++    [unix_glDisableClientState] = sizeof(struct glDisableClientState_params),
++    [unix_glBindTexture] = sizeof(struct glBindTexture_params),
++    [unix_glActiveTexture] = sizeof(struct glActiveTexture_params),
++    [unix_glActiveTextureARB] = sizeof(struct glActiveTextureARB_params),
++    [unix_glClientActiveTexture] = sizeof(struct glClientActiveTexture_params),
++    [unix_glClientActiveTextureARB] = sizeof(struct glClientActiveTextureARB_params),
++    [unix_glTexCoordPointer] = sizeof(struct glTexCoordPointer_params),
++    [unix_glColorPointer] = sizeof(struct glColorPointer_params),
++    [unix_glVertexPointer] = sizeof(struct glVertexPointer_params),
++    [unix_glLockArraysEXT] = sizeof(struct glLockArraysEXT_params),
++    [unix_glUnlockArraysEXT] = sizeof(struct glUnlockArraysEXT_params),
++    [unix_glScissor] = sizeof(struct glScissor_params),
++    [unix_glViewport] = sizeof(struct glViewport_params),
++    [unix_glDepthMask] = sizeof(struct glDepthMask_params),
++    [unix_glDepthFunc] = sizeof(struct glDepthFunc_params),
++    [unix_glDepthRange] = sizeof(struct glDepthRange_params),
++    [unix_glBlendFunc] = sizeof(struct glBlendFunc_params),
++    [unix_glAlphaFunc] = sizeof(struct glAlphaFunc_params),
++    [unix_glCullFace] = sizeof(struct glCullFace_params),
++    [unix_glPolygonOffset] = sizeof(struct glPolygonOffset_params),
++    [unix_glColorMask] = sizeof(struct glColorMask_params),
++    [unix_glMatrixMode] = sizeof(struct glMatrixMode_params),
++    [unix_glLoadIdentity] = sizeof(struct glLoadIdentity_params),
++    [unix_glShadeModel] = sizeof(struct glShadeModel_params),
++    [unix_glPolygonMode] = sizeof(struct glPolygonMode_params),
++    [unix_glColor4f] = sizeof(struct glColor4f_params),
++    [unix_glTexEnvf] = sizeof(struct glTexEnvf_params),
++    [unix_glTexEnvi] = sizeof(struct glTexEnvi_params),
++};
++
++static BOOL gl_batching;
++static DWORD gl_batch_tls = TLS_OUT_OF_INDEXES;
++
++static NTSTATUS flush_gl_batch( struct gl_batch *batch, unsigned int code, void *params )
++{
++    struct gl_batch_params args = { .buffer = batch->data, .used = batch->used, .final_code = code, .final_params = params };
++    NTSTATUS status;
++
++    batch->used = 0;
++    batch->busy = TRUE;
++    status = WINE_UNIX_CALL( unix_gl_batch, &args );
++    batch->busy = FALSE;
++    return status;
++}
++
++NTSTATUS gl_unix_call( unsigned int code, void *params )
++{
++    struct gl_batch *batch;
++    unsigned int size;
++
++    if (!gl_batching) return WINE_UNIX_CALL( code, params );
++    if (!(batch = NtCurrentTeb()->TlsSlots[gl_batch_tls]))
++    {
++        if (!(batch = malloc( sizeof(*batch) ))) return WINE_UNIX_CALL( code, params );
++        batch->used = 0;
++        batch->busy = FALSE;
++        NtCurrentTeb()->TlsSlots[gl_batch_tls] = batch;
++    }
++    if (batch->busy) return WINE_UNIX_CALL( code, params );
++
++    if ((size = gl_batch_sizes[code]))
++    {
++        unsigned int i, words = (size + 3) / 4, room = sizeof(struct gl_batch_entry) + ((size + 7) & ~7u);
++        struct gl_batch_entry *entry;
++        UINT *dst, *src = params;
++
++        if (batch->used + room > GL_BATCH_BYTES) flush_gl_batch( batch, funcs_count, NULL );
++        entry = (struct gl_batch_entry *)(batch->data + batch->used);
++        entry->code = code;
++        entry->size = size;
++        dst = (UINT *)(entry + 1);
++        for (i = 0; i < words; i++) dst[i] = src[i];
++        batch->used += room;
++        return STATUS_SUCCESS;
++    }
++
++    if (!batch->used) return WINE_UNIX_CALL( code, params );
++    return flush_gl_batch( batch, code, params );
++}
++
++/* Asks the unix side whether this process batches; called once, after process_attach. */
++static void init_gl_batch(void)
++{
++    struct gl_batch_params args = { .query = 1 };
++    DWORD index;
++
++    if (WINE_UNIX_CALL( unix_gl_batch, &args ) || !args.enabled) return;
++    if ((index = TlsAlloc()) >= TLS_MINIMUM_AVAILABLE)
++    {
++        if (index != TLS_OUT_OF_INDEXES) TlsFree( index );
++        return;
++    }
++    gl_batch_tls = index;
++    gl_batching = TRUE;
++}
++
+ /***********************************************************************
+  *           OpenGL initialisation routine
+  */
+@@ -3297,6 +3416,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+             return FALSE;
+         }
+         qsort( context_attributes, ARRAY_SIZE(context_attributes), sizeof(*context_attributes), compare_context_attributes );
++        init_gl_batch();
+ 
+         /* fallthrough */
+     case DLL_THREAD_ATTACH:
+@@ -3312,7 +3432,13 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+         UNIX_CALL( process_detach, NULL );
+         /* fallthrough */
+     case DLL_THREAD_DETACH:
++        /* (this hands over what the thread still had in its batch) */
+         UNIX_CALL( thread_detach, NtCurrentTeb() );
++        if (gl_batching)
++        {
++            free( NtCurrentTeb()->TlsSlots[gl_batch_tls] );
++            NtCurrentTeb()->TlsSlots[gl_batch_tls] = NULL;
++        }
+         if ((context = get_current_context())) context->base.current_tid = 0;
+         free( NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_FORMATS_PTR] );
+         return TRUE;

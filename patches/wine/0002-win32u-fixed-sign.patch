@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] win32u: Keep the sign of a FIXED in FT_FixedFromFIXED.
+
+(int)f.value << 16 | (unsigned int)f.fract is an unsigned int. FT_Fixed is a signed long, so where
+long has 64 bits the conversion zero-extended it, and a negative FIXED became a positive number
+near 65536. GetGlyphOutline with a MAT2 that has a negative element (a flip, a rotation) then
+scaled the glyph by tens of thousands.
+
+Skia's GDI font host, as old Chromium and Awesomium have it, always passes a negative eM22, so
+every glyph of such a page came out one pixel high: Quake Live's menu had dashes for text. A 32-bit
+program gets here since its unix side is 64-bit (new WoW64); the line is from 2009 (0737fc2c72c).
+---
+ dlls/win32u/freetype.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/win32u/freetype.c b/dlls/win32u/freetype.c
+index 70bceb201bc..c16501a1968 100644
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -275,7 +275,9 @@ static inline FT_Fixed FT_FixedFromFloat(double f)
+ */
+ static inline FT_Fixed FT_FixedFromFIXED(FIXED f)
+ {
+-    return (FT_Fixed)((int)f.value << 16 | (unsigned int)f.fract);
++    /* As an int first: "int | unsigned int" is unsigned, and where FT_Fixed is 64 bits wide
++       that made every negative FIXED a positive number near 65536. */
++    return (int)((unsigned int)(unsigned short)f.value << 16 | f.fract);
+ }
+ 
+ static BOOL is_hinting_enabled(void)

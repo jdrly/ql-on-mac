@@ -1,0 +1,12 @@
+/work/
+.DS_Store
+/glmt/build/
+/glmt/build-*/
+/app/prebuilt/
+/app/dist/
+/app/.cache/
+
+# an agent's notes about the checkout it works in are not part of the project
+AGENTS.md
+CLAUDE.md
+/council/

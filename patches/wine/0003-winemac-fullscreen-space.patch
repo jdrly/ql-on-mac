@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] winemac.drv: BorderlessFullscreenSpace: a borderless window
+ that covers the screen takes a full-screen Space of its own.
+
+Off unless HKCU\Software\Wine\[AppDefaults\<exe>\]Mac Driver has BorderlessFullscreenSpace=y, or,
+for glmt's program, WINE_GLMT_FULLSCREEN_SPACE=1 is in the environment. The driver enters the
+Space once per window, never while the displays are captured, and says on stderr what it did.
+After aion2-mac-tweaks' winemac-fullscreen-space.patch.
+---
+ dlls/winemac.drv/cocoa_window.h |  3 ++
+ dlls/winemac.drv/cocoa_window.m | 54 ++++++++++++++++++++++++++++++++-
+ dlls/winemac.drv/macdrv_cocoa.h |  1 +
+ dlls/winemac.drv/macdrv_main.c  | 11 +++++++
+ 4 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winemac.drv/cocoa_window.h b/dlls/winemac.drv/cocoa_window.h
+index f8dc941d387..74845df27cb 100644
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -77,6 +77,9 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+ 
+     BOOL enteringFullScreen;
+     BOOL exitingFullScreen;
++    /* BorderlessFullscreenSpace: the driver moved, or tried to move, this window into a
++       full-screen Space of its own.  It does that once per window. */
++    BOOL fullscreenSpaceTried;
+     NSRect nonFullscreenFrame;
+     NSTimeInterval enteredFullScreenTime;
+ 
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index 896d1ffce09..b565bf1569e 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1289,9 +1289,15 @@ - (void) adjustFeaturesForState
+     - (void) adjustFullScreenBehavior:(NSWindowCollectionBehavior)behavior
+     {
+         NSUInteger style = [self styleMask];
++        /* BorderlessFullscreenSpace: a borderless window covering the screen (a game's
++           fullscreen) may also use a native full-screen Space.  Kept while in the Space,
++           where `fullscreen` reads false. */
++        BOOL borderlessFullscreen = borderless_fullscreen_space && !(style & NSWindowStyleMaskTitled) &&
++                                    (fullscreen || (style & NSWindowStyleMaskFullScreen));
+ 
+         if (behavior & NSWindowCollectionBehaviorParticipatesInCycle &&
+-            style & NSWindowStyleMaskResizable && !(style & NSWindowStyleMaskUtilityWindow) && !maximized &&
++            (style & NSWindowStyleMaskResizable || borderlessFullscreen) &&
++            !(style & NSWindowStyleMaskUtilityWindow) && !maximized &&
+             !(self.parentWindow || self.latentParentWindow))
+         {
+             behavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+@@ -1967,6 +1973,9 @@ - (void) orderBelow:(WineWindow*)prev orAbove:(WineWindow*)next activate:(BOOL)a
+                 [controller adjustWindowLevels];
+             }
+ 
++            /* (a window that covered the screen before it was shown) */
++            [self enterFullscreenSpaceIfWanted];
++
+             if (pendingMinimize)
+             {
+                 [self miniaturizeForWin32];
+@@ -2098,7 +2107,47 @@ - (void) updateFullscreen
+                 [controller updateFullscreenWindows];
+ 
+             [controller adjustWindowLevels];
++
++            if (borderless_fullscreen_space && !([self styleMask] & NSWindowStyleMaskTitled))
++                [self adjustFullScreenBehavior:[self collectionBehavior]];
+         }
++
++        [self enterFullscreenSpaceIfWanted];
++    }
++
++    /* BorderlessFullscreenSpace: move a borderless window that covers the screen into a
++       full-screen Space of its own, once it has settled (the frame change that made it cover
++       the screen is still being processed).  Once per window: a window that left the Space,
++       by the player's hand or because AppKit refused, stays out.  The lines go to stderr
++       whatever WINEDEBUG says, so that a session's log tells what happened. */
++    - (void) enterFullscreenSpaceIfWanted
++    {
++        if (!borderless_fullscreen_space || fullscreenSpaceTried || !fullscreen ||
++            ([self styleMask] & NSWindowStyleMaskTitled))
++            return;
++
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (fullscreenSpaceTried || !fullscreen || ![self isVisible] || enteringFullScreen ||
++                ([self styleMask] & (NSWindowStyleMaskFullScreen | NSWindowStyleMaskTitled)))
++                return;
++
++            fullscreenSpaceTried = TRUE;
++            if ([[WineApplicationController sharedController] areDisplaysCaptured])
++                fprintf(stderr, "winemac: fullscreen space: not entered, the displays are captured\n");
++            else if (self.disabled || maximized)
++                fprintf(stderr, "winemac: fullscreen space: not entered, the window is disabled or maximized\n");
++            else
++            {
++                [self adjustFullScreenBehavior:[self collectionBehavior]];
++                if ([self collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)
++                {
++                    fprintf(stderr, "winemac: fullscreen space: entering\n");
++                    [self toggleFullScreen:nil];
++                }
++                else
++                    fprintf(stderr, "winemac: fullscreen space: not entered, the window cannot take a Space of its own\n");
++            }
++        });
+     }
+ 
+     /* Cocoa rounds a frame to whole points, which are two Windows pixels in
+@@ -3183,6 +3232,7 @@ - (void) windowDidEnterFullScreen:(NSNotification*)notification
+     {
+         enteringFullScreen = FALSE;
+         enteredFullScreenTime = [[NSProcessInfo processInfo] systemUptime];
++        if (borderless_fullscreen_space) fprintf(stderr, "winemac: fullscreen space: entered\n");
+         if (pendingOrderOut)
+             [self doOrderOut];
+     }
+@@ -3190,6 +3240,7 @@ - (void) windowDidEnterFullScreen:(NSNotification*)notification
+     - (void) windowDidExitFullScreen:(NSNotification*)notification
+     {
+         exitingFullScreen = FALSE;
++        if (borderless_fullscreen_space) fprintf(stderr, "winemac: fullscreen space: left\n");
+         [self setFrameAndWineFrame:nonFullscreenFrame];
+         [self windowDidResize:nil];
+         /* AppKit dropped the full-screen presentation options, bit included. */
+@@ -3202,6 +3253,7 @@ - (void) windowDidFailToEnterFullScreen:(NSWindow*)window
+     {
+         enteringFullScreen = FALSE;
+         enteredFullScreenTime = 0;
++        if (borderless_fullscreen_space) fprintf(stderr, "winemac: fullscreen space: AppKit did not enter it\n");
+         if (pendingOrderOut)
+             [self doOrderOut];
+     }
+diff --git a/dlls/winemac.drv/macdrv_cocoa.h b/dlls/winemac.drv/macdrv_cocoa.h
+index 51c7158b10d..58cf9bbf202 100644
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -110,6 +110,7 @@
+ extern bool allow_immovable_windows;
+ extern bool use_confinement_cursor_clipping;
+ extern bool cursor_clipping_locks_windows;
++extern bool borderless_fullscreen_space;
+ extern bool use_precise_scrolling;
+ extern bool use_gcmouse;
+ extern bool ime_fallback_position_set;
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 132fce998c6..5ac3620bc00 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -49,6 +49,7 @@ bool allow_software_rendering = false;
+ bool allow_immovable_windows = true;
+ bool use_confinement_cursor_clipping = true;
+ bool cursor_clipping_locks_windows = true;
++bool borderless_fullscreen_space = false;
+ bool use_precise_scrolling = true;
+ bool use_gcmouse = false;  /* from compatdb, see setup_options */
+ /* Where the input method window goes, in client coordinates of the focus
+@@ -348,6 +349,16 @@ static void setup_options(void)
+     if (!get_config_key(hkey, appkey, "CursorClippingLocksWindows", buffer, sizeof(buffer)))
+         cursor_clipping_locks_windows = IS_OPTION_TRUE(buffer[0]);
+ 
++    if (!get_config_key(hkey, appkey, "BorderlessFullscreenSpace", buffer, sizeof(buffer)))
++        borderless_fullscreen_space = IS_OPTION_TRUE(buffer[0]);
++    /* glmt's program (Quake Live) can be told by the environment too, so that one session can
++       try it without a write to the registry: WINE_GLMT_FULLSCREEN_SPACE=1 (or 0). */
++    if (macdrv_glmt_wanted())
++    {
++        const char *value = getenv("WINE_GLMT_FULLSCREEN_SPACE");
++        if (value && *value) borderless_fullscreen_space = IS_OPTION_TRUE(value[0]);
++    }
++
+     if (!get_config_key(hkey, appkey, "UsePreciseScrolling", buffer, sizeof(buffer)))
+         use_precise_scrolling = IS_OPTION_TRUE(buffer[0]);
+ 

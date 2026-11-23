@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] winemac.drv: OpenGL through glmt (OpenGL 1.x on Metal) for
+ Quake Live.
+
+A program that is glmt's (quakelive_steam.exe by default, WINE_GLMT_EXE and WINE_GLMT otherwise)
+gets every OpenGL entry point from libglmt.dylib, loaded from next to winemac.so (WINE_GLMT_LIB).
+glmt renders into the CAMetalLayer of the client surface's Metal view. If it does not start, the
+program has no OpenGL: there is no fallback to Mesa's EGL or to Apple's OpenGL.
+
+Written against Mach9 0.4.0's Wine (501796b0ed1).
+---
+ dlls/winemac.drv/Makefile.in |   1 +
+ dlls/winemac.drv/glmt.c      | 391 +++++++++++++++++++++++++++++++++++
+ dlls/winemac.drv/macdrv.h    |   2 +
+ dlls/winemac.drv/opengl.c    |  10 +
+ 4 files changed, 404 insertions(+)
+ create mode 100644 dlls/winemac.drv/glmt.c
+
+diff --git a/dlls/winemac.drv/Makefile.in b/dlls/winemac.drv/Makefile.in
+index 5cd5ea70a98..f81727ed76d 100644
+--- a/dlls/winemac.drv/Makefile.in
++++ b/dlls/winemac.drv/Makefile.in
+@@ -33,6 +33,7 @@ SOURCES = \
+ 	egl.c \
+ 	event.c \
+ 	gdi.c \
++	glmt.c \
+ 	image.c \
+ 	ime.c \
+ 	keyboard.c \
+diff --git a/dlls/winemac.drv/glmt.c b/dlls/winemac.drv/glmt.c
+new file mode 100644
+index 00000000000..2aaa63361bb
+--- /dev/null
++++ b/dlls/winemac.drv/glmt.c
+@@ -0,0 +1,391 @@
++/*
++ * Mac driver OpenGL support through glmt (OpenGL 1.x on Metal)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <ctype.h>
++#include <dlfcn.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "macdrv.h"
++#include "wine/debug.h"
++#include "wine/opengl_driver.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wgl);
++
++/* glmt (libglmt.dylib, from the ql-on-mac repository) translates the OpenGL 1.x that id Tech 3
++ * games draw with straight to Metal. For the programs it is meant for, it is the whole OpenGL:
++ * every entry point win32u asks for comes from it, and neither Apple's OpenGL nor Mesa draws
++ * anything (win32u still loads Mesa's libEGL when the engine has one, and never initializes it).
++ * It renders into the CAMetalLayer of the client surface's Metal view, the layer Vulkan surfaces
++ * and the EGL driver use.
++ *
++ * What follows mirrors glmt.h at GLMT_ABI_VERSION 1; glmt_init refuses another version. */
++
++#define GLMT_ABI_VERSION 1
++
++struct glmt_pixel_format
++{
++    unsigned char color_bits;
++    unsigned char alpha_bits;
++    unsigned char depth_bits;
++    unsigned char stencil_bits;
++    unsigned char double_buffer;
++};
++
++struct glmt_host
++{
++    unsigned int abi_version;
++    void (*log)(const char *line);
++};
++
++#define GLMT_FUNCS \
++    GLMT_FUNC(int, glmt_init, (const struct glmt_host *host)) \
++    GLMT_FUNC(void *, glmt_get_proc_address, (const char *name)) \
++    GLMT_FUNC(unsigned int, glmt_pixel_format_count, (void)) \
++    GLMT_FUNC(int, glmt_describe_pixel_format, (unsigned int index, struct glmt_pixel_format *format)) \
++    GLMT_FUNC(void *, glmt_context_create, (void *share)) \
++    GLMT_FUNC(void, glmt_context_destroy, (void *context)) \
++    GLMT_FUNC(void *, glmt_surface_create, (void *layer, int width, int height, unsigned int pixel_format)) \
++    GLMT_FUNC(void, glmt_surface_destroy, (void *surface)) \
++    GLMT_FUNC(void, glmt_surface_resize, (void *surface, int width, int height)) \
++    GLMT_FUNC(int, glmt_make_current, (void *context, void *surface)) \
++    GLMT_FUNC(int, glmt_swap_buffers, (void *surface, int interval))
++
++#define GLMT_FUNC(ret, name, args) static ret (*p_##name) args;
++GLMT_FUNCS
++#undef GLMT_FUNC
++
++struct glmt_drawable
++{
++    struct opengl_drawable base;
++    void *surface;  /* glmt's surface */
++    SIZE size;      /* the size glmt's surface has */
++};
++
++static const struct opengl_drawable_funcs glmt_drawable_funcs;
++
++static struct glmt_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
++{
++    return CONTAINING_RECORD(base, struct glmt_drawable, base);
++}
++
++/***********************************************************************
++ *              macdrv_glmt_wanted
++ *
++ * Whether this process draws its OpenGL through glmt: by default Quake Live only.
++ * WINE_GLMT_EXE names other programs (file names, separated by commas), WINE_GLMT=1 means
++ * every program and WINE_GLMT=0 none.
++ */
++bool macdrv_glmt_wanted(void)
++{
++    const char *value = getenv("WINE_GLMT"), *list = getenv("WINE_GLMT_EXE");
++    const WCHAR *appname, *p;
++    char name[MAX_PATH];
++    size_t len, i;
++
++    if (value && !strcmp(value, "0")) return false;
++    if (value && !strcmp(value, "1")) return true;
++    if (!list || !*list) list = "quakelive_steam.exe";
++
++    appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
++    if ((p = wcsrchr(appname, '/'))) appname = p + 1;
++    if ((p = wcsrchr(appname, '\\'))) appname = p + 1;
++    for (len = 0; appname[len] && len < sizeof(name) - 1; len++)
++        name[len] = appname[len] < 0x80 ? tolower((char)appname[len]) : '?';
++    name[len] = 0;
++    if (!len) return false;
++
++    while (*list)
++    {
++        const char *end = strchr(list, ',');
++        size_t item = end ? (size_t)(end - list) : strlen(list);
++
++        if (item == len)
++        {
++            for (i = 0; i < len && tolower(list[i]) == name[i]; i++) {}
++            if (i == len) return true;
++        }
++        list += item;
++        if (*list == ',') list++;
++    }
++    return false;
++}
++
++static void glmt_host_log(const char *line)
++{
++    MESSAGE("%s\n", line);
++}
++
++static void *glmt_get_proc_address(const char *name)
++{
++    return p_glmt_get_proc_address(name);
++}
++
++static UINT glmt_init_pixel_formats(UINT *onscreen_count)
++{
++    /* Every format is for a window. */
++    *onscreen_count = p_glmt_pixel_format_count();
++    return *onscreen_count;
++}
++
++static BOOL glmt_describe_pixel_format(int format, struct wgl_pixel_format *descr)
++{
++    struct glmt_pixel_format pf;
++
++    if (format <= 0 || p_glmt_describe_pixel_format(format - 1, &pf)) return FALSE;
++
++    memset(descr, 0, sizeof(*descr));
++    descr->pfd.nSize        = sizeof(descr->pfd);
++    descr->pfd.nVersion     = 1;
++    descr->pfd.dwFlags      = PFD_SUPPORT_OPENGL | PFD_DRAW_TO_WINDOW | PFD_SUPPORT_COMPOSITION;
++    if (pf.double_buffer)   descr->pfd.dwFlags |= PFD_DOUBLEBUFFER;
++    descr->pfd.iPixelType   = PFD_TYPE_RGBA;
++    descr->pfd.cColorBits   = pf.color_bits;
++    descr->pfd.cRedBits     = 8;
++    descr->pfd.cRedShift    = 16;
++    descr->pfd.cGreenBits   = 8;
++    descr->pfd.cGreenShift  = 8;
++    descr->pfd.cBlueBits    = 8;
++    descr->pfd.cBlueShift   = 0;
++    descr->pfd.cAlphaBits   = pf.alpha_bits;
++    descr->pfd.cAlphaShift  = pf.alpha_bits ? 24 : 0;
++    descr->pfd.cDepthBits   = pf.depth_bits;
++    descr->pfd.cStencilBits = pf.stencil_bits;
++    descr->pfd.iLayerType   = PFD_MAIN_PLANE;
++    descr->swap_method      = WGL_SWAP_UNDEFINED_ARB;
++    descr->pixel_type       = WGL_TYPE_RGBA_ARB;
++    return TRUE;
++}
++
++static void glmt_init_extensions(struct opengl_funcs *funcs, BOOLEAN extensions[GL_EXTENSION_COUNT])
++{
++    /* win32u reads the OpenGL extensions from glGetString and adds WGL_EXT_swap_control itself. */
++}
++
++static BOOL glmt_surface_create(struct client_surface *client, int format, struct opengl_drawable **drawable)
++{
++    struct macdrv_client_surface *surface = impl_from_client_surface(client);
++    struct glmt_drawable *gl;
++    CAMetalLayer *layer;
++
++    TRACE("client %s, format %d\n", debugstr_client_surface(client), format);
++
++    if (!macdrv_client_surface_acquire_metal_swapchain(surface)) return FALSE;
++    if (!(gl = opengl_drawable_create(&glmt_drawable_funcs, format, client, NULL))) return FALSE;
++
++    /* The buffer map stays win32u's default: with the front buffers mapped to the back ones, as
++       the EGL driver has them, opengl32 would call glBlitFramebuffer on a front buffer flush. */
++
++    /* (a call on the main thread: once, here) */
++    layer = macdrv_swapchain_get_layer(surface->metal_swapchain);
++    gl->size = gl->base.monitor_size;
++    if (!(gl->surface = p_glmt_surface_create(layer, gl->size.cx, gl->size.cy, format - 1)))
++    {
++        ERR("glmt made no surface for %s\n", debugstr_client_surface(client));
++        opengl_drawable_release(&gl->base);
++        return FALSE;
++    }
++    /* glmt renders at the window's physical size and does not scale: a window that is DPI
++       virtualized would draw into a corner of it. */
++    if (!client->raw && (gl->base.virtual_size.cx != gl->base.monitor_size.cx ||
++                         gl->base.virtual_size.cy != gl->base.monitor_size.cy))
++        FIXME("%s is DPI virtualized (%dx%d in a %dx%d surface), and glmt does not scale\n",
++              debugstr_opengl_drawable(&gl->base), (int)gl->base.virtual_size.cx, (int)gl->base.virtual_size.cy,
++              (int)gl->base.monitor_size.cx, (int)gl->base.monitor_size.cy);
++
++    TRACE("Created drawable %s with glmt surface %p\n", debugstr_opengl_drawable(&gl->base), gl->surface);
++    *drawable = &gl->base;
++    return TRUE;
++}
++
++static void glmt_drawable_destroy(struct opengl_drawable *base)
++{
++    struct glmt_drawable *gl = impl_from_opengl_drawable(base);
++
++    TRACE("drawable %s\n", debugstr_opengl_drawable(base));
++    /* The Metal layer belongs to the client surface, which outlives glmt's surface. */
++    if (gl->surface) p_glmt_surface_destroy(gl->surface);
++}
++
++static void glmt_drawable_flush(struct opengl_drawable *base, UINT flags)
++{
++    struct glmt_drawable *gl = impl_from_opengl_drawable(base);
++
++    TRACE("drawable %s, flags %#x\n", debugstr_opengl_drawable(base), flags);
++
++    if ((flags & GL_FLUSH_UPDATED) &&
++        (gl->size.cx != base->monitor_size.cx || gl->size.cy != base->monitor_size.cy))
++    {
++        gl->size = base->monitor_size;
++        p_glmt_surface_resize(gl->surface, gl->size.cx, gl->size.cy);
++    }
++}
++
++static BOOL glmt_drawable_swap(struct opengl_drawable *base)
++{
++    struct glmt_drawable *gl = impl_from_opengl_drawable(base);
++    int interval = 0;
++
++    /* As with CGL, a single-buffered surface would otherwise wait for vsync on every flush. */
++    if (allow_vsync && base->doublebuffer && base->interval != INT_MIN) interval = abs(base->interval);
++
++    client_surface_present(base->client);
++    if (p_glmt_swap_buffers(gl->surface, interval)) WARN("glmt_swap_buffers failed\n");
++    return TRUE;
++}
++
++static const struct opengl_drawable_funcs glmt_drawable_funcs =
++{
++    .size = sizeof(struct glmt_drawable),
++    .destroy = glmt_drawable_destroy,
++    .flush = glmt_drawable_flush,
++    .swap = glmt_drawable_swap,
++};
++
++static struct opengl_context *glmt_context_create(const struct opengl_context_attrs *attrs, struct opengl_context *share)
++{
++    struct opengl_context *context;
++
++    TRACE("attrs %s, share %p\n", debugstr_opengl_context_attrs(attrs), share);
++
++    /* glmt has one kind of context, OpenGL 1.3, whatever is asked for: win32u asks for a core
++       profile for its root context and reads the version back from glGetString. */
++    if (!(context = calloc(1, sizeof(*context)))) return NULL;
++    if (!(context->host_context = p_glmt_context_create(share ? share->host_context : NULL)))
++    {
++        free(context);
++        return NULL;
++    }
++    return context;
++}
++
++static BOOL glmt_context_destroy(struct opengl_context *context)
++{
++    TRACE("context %p\n", context);
++    if (context->host_context) p_glmt_context_destroy(context->host_context);
++    free(context);
++    return TRUE;
++}
++
++static BOOL glmt_context_activate(struct opengl_context *context, struct opengl_drawable *draw, struct opengl_drawable *read)
++{
++    void *surface = NULL;
++
++    TRACE("context %p, draw %s, read %s\n", context, debugstr_opengl_drawable(draw), debugstr_opengl_drawable(read));
++
++    if (!context->host_context) return FALSE;
++    /* (win32u's own framebuffer surfaces, for pbuffers and memory DCs, are not glmt's) */
++    if (draw && draw->funcs == &glmt_drawable_funcs) surface = impl_from_opengl_drawable(draw)->surface;
++    if (read && read != draw) FIXME("a read drawable other than the draw drawable is not supported\n");
++    return !p_glmt_make_current(context->host_context, surface);
++}
++
++static BOOL glmt_pbuffer_create(HDC hdc, int format, SIZE size, BOOL largest, GLenum texture_format, GLenum texture_target,
++                                GLint max_level, struct opengl_drawable **drawable)
++{
++    /* win32u then tries a framebuffer object, which glmt does not have either. */
++    FIXME("pbuffers are not supported\n");
++    return FALSE;
++}
++
++static BOOL glmt_cleanup_thread(void)
++{
++    p_glmt_make_current(NULL, NULL);
++    return TRUE;
++}
++
++static const struct opengl_driver_funcs glmt_driver_funcs =
++{
++    .p_get_proc_address = glmt_get_proc_address,
++    .p_init_pixel_formats = glmt_init_pixel_formats,
++    .p_describe_pixel_format = glmt_describe_pixel_format,
++    .p_init_extensions = glmt_init_extensions,
++    .p_surface_create = glmt_surface_create,
++    .p_context_create = glmt_context_create,
++    .p_context_destroy = glmt_context_destroy,
++    .p_context_activate = glmt_context_activate,
++    .p_pbuffer_create = glmt_pbuffer_create,
++    .p_cleanup_thread = glmt_cleanup_thread,
++};
++
++/***********************************************************************
++ *              macdrv_glmt_init
++ *
++ * Load libglmt.dylib (the file WINE_GLMT_LIB names, or the one next to winemac.so) and make it
++ * the process's OpenGL. On failure, reason says why; the caller does not fall back.
++ */
++UINT macdrv_glmt_init(const struct opengl_driver_funcs **driver_funcs, char *reason, size_t len)
++{
++    struct glmt_host host = { .abi_version = GLMT_ABI_VERSION };
++    const char *path = getenv("WINE_GLMT_LIB");
++    char buffer[PATH_MAX];
++    void *handle;
++    Dl_info info;
++
++    if (!path || !*path)
++    {
++        char *slash;
++
++        if (!dladdr((void *)macdrv_glmt_init, &info) || !info.dli_fname || strlen(info.dli_fname) >= sizeof(buffer) - 16)
++        {
++            snprintf(reason, len, "winemac.so does not find its own path");
++            return STATUS_NOT_SUPPORTED;
++        }
++        strcpy(buffer, info.dli_fname);
++        if ((slash = strrchr(buffer, '/'))) slash[1] = 0;
++        else buffer[0] = 0;
++        strcat(buffer, "libglmt.dylib");
++        path = buffer;
++    }
++
++    if (!(handle = dlopen(path, RTLD_NOW | RTLD_LOCAL)))
++    {
++        snprintf(reason, len, "%s does not load (%s)", path, dlerror());
++        return STATUS_NOT_SUPPORTED;
++    }
++#define GLMT_FUNC(ret, name, args) \
++    if (!(p_##name = dlsym(handle, #name))) \
++    { \
++        snprintf(reason, len, "%s has no %s", path, #name); \
++        dlclose(handle); \
++        return STATUS_NOT_SUPPORTED; \
++    }
++    GLMT_FUNCS
++#undef GLMT_FUNC
++
++    /* glmt's log goes where Wine's does, unless GLMT_LOG names a file for it */
++    if (!getenv("GLMT_LOG")) host.log = glmt_host_log;
++    if (p_glmt_init(&host))
++    {
++        snprintf(reason, len, "%s does not start (another ABI than %d, or no Metal device)", path, GLMT_ABI_VERSION);
++        dlclose(handle);
++        return STATUS_NOT_SUPPORTED;
++    }
++
++    TRACE("using glmt from %s\n", debugstr_a(path));
++    *driver_funcs = &glmt_driver_funcs;
++    return STATUS_SUCCESS;
++}
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 7d7356dff7e..9d4944a2eda 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -331,6 +331,8 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern void macdrv_lost_pasteboard_ownership(HWND hwnd);
+ 
+ extern UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
++extern bool macdrv_glmt_wanted(void);
++extern UINT macdrv_glmt_init(const struct opengl_driver_funcs **driver_funcs, char *reason, size_t len);
+ extern UINT macdrv_egl_init(const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs,
+                             char *reason, size_t len);
+ extern UINT macdrv_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index a5ff2018f40..c99d011ac6d 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -2091,6 +2091,16 @@ UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, co
+         return STATUS_INVALID_PARAMETER;
+     }
+ 
++    /* A program that is glmt's (Quake Live, and what WINE_GLMT_EXE names) gets its OpenGL from
++       glmt, OpenGL 1.x straight on Metal, whatever compatdb says. If glmt does not start, the
++       program has no OpenGL: neither Mesa's nor Apple's stands in for it. */
++    if (macdrv_glmt_wanted())
++    {
++        if ((status = macdrv_glmt_init(driver_funcs, reason, sizeof(reason))))
++            ERR_(winediag)("this program's OpenGL is glmt, but %s; OpenGL is disabled\n", reason);
++        return status;
++    }
++
+     /* compatdb.so chooses: 1 for Mesa's EGL, with Zink on KosmicKrisp, 0 for Apple's
+        OpenGL. Without a value Apple's OpenGL is used, as upstream. */
+     if (ntdll_get_compat_opengl() == 1)

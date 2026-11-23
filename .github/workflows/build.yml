@@ -1,0 +1,164 @@
+# Builds and tests of QL on Mac.
+#
+# NOT RUN YET. The same builds run on the Mac with scripts/ql.zsh build; this is for when a pull
+# request should prove them without the Mac.
+#
+#   test     glmt's front end and its tests on Linux, plain and under the address and undefined
+#            behaviour sanitizers. Every pull request.
+#   glmt     libglmt.dylib (arm64, with the Metal backend) on a macOS runner, and the same tests
+#            there. Every pull request. Artifact: libglmt.
+#   winemac  the engine's Mac driver with patches/wine (ci/wine.zsh), built as Mach9 0.4.0 built
+#            the engine's. By hand only (Run workflow, "winemac" ticked): it configures a Wine tree,
+#            about a quarter of an hour of a macOS runner. Artifact: winemac.
+#
+# On the Mac, with both artifacts in one folder: scripts/install-glmt.zsh <folder>.
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      winemac:
+        description: Build winemac.so with patches/wine too
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - glmt/**
+      - patches/wine/**
+      - ci/**
+      - .github/workflows/build.yml
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # athei/wine's commit Mach9 0.4.0 was built from (wine-11.21-54-g501796b0ed), in jdrly/wine too
+  WINE_REPOSITORY: jdrly/wine
+  WINE_COMMIT: 501796b0ed15759127c2a5f415d31570cdee34f3
+  # What Mach9's release run of v0.4.0 used, as jdrly/wine's own workflow records it
+  ENGINE_RUNNER: macos-26
+  ENGINE_XCODE_VERSION: "26.6"
+  LLVM_MINGW_VERSION: "20261104"
+  LLVM_MINGW_SHA256: 66cbd5178c4a71b0d473e68ede172f8eb7d15d023e67f39201d0a69e21f6bf3c
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Front end tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tests
+        run: make -C glmt test
+      - name: Tests under the sanitizers
+        run: |
+          make -C glmt test BUILD=build-sanitize OPT="-O1 -g" \
+            CFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" \
+            LDFLAGS="-fsanitize=address,undefined"
+        env:
+          # the recording backend of the tests keeps every arena on purpose
+          ASAN_OPTIONS: detect_leaks=0
+      - name: The generated list of OpenGL 1.1 names has 336 entries
+        run: test "$(grep -c '^GL_CORE(' glmt/src/gl_core.inc)" = 336
+
+  glmt:
+    name: libglmt.dylib (macOS, arm64)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: |
+          {
+            echo '```'
+            echo "macOS $(sw_vers -productVersion), $(xcodebuild -version | sed -n 1p), SDK $(xcrun -sdk macosx --show-sdk-version)"
+            clang --version | sed -n 1p
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Tests
+        run: make -C glmt test
+      - name: Build
+        run: |
+          make -C glmt
+          lipo -archs glmt/build/libglmt.dylib
+          # the host's interface and nothing else
+          nm -gU glmt/build/libglmt.dylib | tee "$RUNNER_TEMP/exports.txt"
+          test "$(grep -c ' T _glmt_' "$RUNNER_TEMP/exports.txt")" = 12
+      - name: The shaders compile, each specialization as a pipeline
+        run: make -C glmt shadercheck
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libglmt
+          path: glmt/build/libglmt.dylib
+          if-no-files-found: error
+
+  winemac:
+    name: winemac.so with patches/wine
+    if: github.event_name == 'workflow_dispatch' && inputs.winemac
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "26.4"
+      # the engine's own paths: its debug map names them
+      SRC: /Users/runner/work/mach9/mach9/src
+      BUILD: /Users/runner/work/mach9/mach9/build/wine
+      MINGW_DIR: ${{ github.workspace }}/toolchains/llvm-mingw
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+    steps:
+      - name: Select Xcode
+        run: |
+          app=/Applications/Xcode_$ENGINE_XCODE_VERSION.app
+          [[ -d $app ]] || { echo "::error::Xcode $ENGINE_XCODE_VERSION isn't on this runner's image"; ls -d /Applications/Xcode_*.app; exit 1; }
+          sudo xcode-select -s "$app"
+          xcodebuild -version | sed -n 1p | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ql
+      - name: Check out Wine
+        run: |
+          mkdir -p "$(dirname "$SRC")"
+          git clone --quiet "https://github.com/$WINE_REPOSITORY" "$SRC"
+      - name: Restore llvm-mingw
+        id: mingw
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+          path: toolchains/llvm-mingw
+      - name: Download llvm-mingw
+        if: steps.mingw.outputs.cache-hit != 'true'
+        run: |
+          f="llvm-mingw-$LLVM_MINGW_VERSION-ucrt-macos-universal.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/$f"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/$f" | shasum -a 256 -c
+          mkdir -p toolchains/llvm-mingw
+          tar -xf "$RUNNER_TEMP/$f" -C toolchains/llvm-mingw --strip-components 1
+      - name: Save llvm-mingw
+        if: steps.mingw.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}
+          path: toolchains/llvm-mingw
+      - name: Install Homebrew's bison, freetype, gnutls and SDL
+        run: brew install bison freetype gnutls sdl2-compat pkgconf
+      - name: Apply patches/wine
+        run: ql/ci/wine.zsh prepare "$WINE_COMMIT" "$GITHUB_WORKSPACE/ql/patches/wine"
+      - name: Configure
+        run: ql/ci/wine.zsh configure
+      - name: Build
+        run: ql/ci/wine.zsh build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: winemac
+          path: |
+            ${{ env.BUILD }}/dlls/winemac.drv/winemac.so
+            ${{ env.BUILD }}/dlls/win32u/win32u.so
+          if-no-files-found: error
