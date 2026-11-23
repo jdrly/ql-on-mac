@@ -138,7 +138,7 @@ Steam Cloud carries the trimmed config to your other computers.
 
 | Folder | What |
 |---|---|
-| `glmt/` | The translator. `make -C glmt test` runs its tests on any system. `make -C glmt` builds `libglmt.dylib` on macOS. |
+| `glmt/` | The translator. It also has a repository of its own, [jdrly/glmt](https://github.com/jdrly/glmt), with the same code. `make -C glmt test` runs its tests on any system. `make -C glmt` builds `libglmt.dylib` on macOS. |
 | `patches/wine/` | Four patches to Wine at the engine's commit. The build takes Wine's source from [my fork](https://github.com/jdrly/wine), which has that commit. |
 | `scripts/` | Setup, play and the builds on the Mac. `scripts/ql.zsh` is the one command. |
 | `app/` | The launcher app. |

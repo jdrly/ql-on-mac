@@ -1,0 +1,51 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "srgb:0.13725,0.04314,0.03529,1.00000",
+      "srgb:0.02745,0.01176,0.01176,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "name": "spike",
+      "layers": [
+        {
+          "image-name": "spike.svg",
+          "name": "spike"
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.6
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "name": "ring",
+      "layers": [
+        {
+          "image-name": "ring.svg",
+          "name": "ring"
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.5
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

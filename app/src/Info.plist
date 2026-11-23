@@ -8,6 +8,10 @@
 	<string>QL on Mac</string>
 	<key>CFBundleExecutable</key>
 	<string>QLonMac</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>cz.jandrly.qlonmac</string>
 	<key>CFBundleInfoDictionaryVersion</key>

@@ -6,9 +6,10 @@ its own bottle, Steam from Valve, the game through Steam. It follows
 the bundle, [Sparkle](https://github.com/sparkle-project/Sparkle) for updates)
 and is cut down to what fits on one screen.
 
-Status (2026-11-23): written. The backend is tested in a sandbox on Linux (57 checks, a
-Wine that only pretends). **The Swift has not been compiled**, nothing of the window has been
-seen, and no real install has run. It never touches a development checkout's `work/`.
+Status (2026-11-23): it builds, and every state of the window has been rendered to pictures
+and looked at. The backend passes its sandbox test on Linux and on the Mac (57 checks, a Wine
+that only pretends). **Nobody has opened the app on a screen yet, and no real install has run.**
+It never touches a development checkout's `work/`.
 
 ## The window
 
@@ -76,6 +77,17 @@ pictures only. Needs Xcode 27; Sparkle 2.10.0 is downloaded at a pinned sha256.
 The components are always built from the checkout, never copied out of an engine: on
 2026-11-23 the development engine's driver still carried a patch that had been taken out.
 
+## The icon
+
+`src/AppIcon.icon` is an Icon Composer document: two SVG layers and `icon.json` with the
+background and each layer's glass settings. `build.zsh` compiles it with `actool` into
+`Assets.car`, which macOS 26 and later draws as a Liquid Glass icon, and an `AppIcon.icns` as
+the fallback. `scripts/icon-preview.zsh` renders it with Icon Composer's own `ictool` in the six
+appearances and at the small sizes.
+
+The mark is my own drawing, a ring and a blade that make a Q, in red and white on near black.
+It is not id Software's Quake emblem and must not turn into a copy of it.
+
 ## Testing
 
 `app/scripts/test-backend.zsh` runs the backend from a first install to an uninstall in
@@ -92,4 +104,4 @@ Two things are open; neither blocks building it or using it on the Mac it was bu
 - **Signing.** A Developer ID signature and notarization (GW2 on Mac's `release.sh` does both).
   The engine's files are re-signed ad hoc when they go in, as the scripts do.
 
-Also open: an icon (the bundle has none), a first real install, and Retina off.
+Also open: a first real install, and Retina off.

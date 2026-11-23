@@ -203,12 +203,13 @@ struct ReadyView: View {
           }
           .pickerStyle(.segmented)
           .labelsHidden()
-          .frame(width: 130)
+          .fixedSize()
         }
         SettingRow(label: "Retina", value: model.displayScaled ? model.resolution : nil, hint: retinaHint) {
           HStack(spacing: 12) {
             if model.retinaWaits {
               Button("Quit Steam") { model.quitSteam() }
+                .fixedSize()
             }
             Toggle("Retina", isOn: Binding(get: { model.retina }, set: { model.set("retina", $0 ? "on" : "off") }))
               .toggleStyle(.switch)
@@ -219,6 +220,7 @@ struct ReadyView: View {
         SettingRow(label: "Automatic updates", value: "Version \(updates.version)", hint: updates.available ? nil : "This build has no update feed.") {
           HStack(spacing: 12) {
             Button("Check Now") { updates.check() }
+              .fixedSize()
               .disabled(!updates.available)
             Toggle("Automatic updates", isOn: Binding(get: { updates.automatic }, set: { updates.setAutomatic($0) }))
               .toggleStyle(.switch)

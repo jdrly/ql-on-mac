@@ -10,6 +10,7 @@
 # In the bundle:
 #   Contents/MacOS/QLonMac              the window (src/native), arm64
 #   Contents/Frameworks/Sparkle.framework   app updates (pinned below; off without a feed)
+#   Contents/Resources/Assets.car, AppIcon.icns   the icon, from src/AppIcon.icon (Icon Composer)
 #   Contents/Resources/qlom.zsh         the backend (src/qlom.zsh), common.zsh beside it
 #   Contents/Resources/components/      winemac.so, win32u.so, libglmt.dylib, opengl32.so,
 #                                       opengl32.dll and their STAMP (app/prebuilt/)
@@ -92,6 +93,16 @@ cp "$SPARKLE/LICENSE" "$R/Licenses/Sparkle-LICENSE.txt"
 commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || print none)
 [[ -z "$(git -C "$repo" status --porcelain 2>/dev/null)" ]] || commit="$commit with changes"
 print -rl -- "app $VERSION" "commit $commit" "sparkle $SPARKLE_VERSION" >"$R/VERSIONS"
+
+# The icon: Icon Composer's document compiled into Assets.car (CFBundleIconName, the Liquid Glass
+# icon macOS 26 and later draws) and the .icns actool makes from it (CFBundleIconFile, the
+# fallback). actool wants absolute paths.
+icon="$CACHE/AppIcon"
+rm -rf "$icon"; mkdir -p "$icon"
+xcrun actool "$here/src/AppIcon.icon" --compile "$icon" --platform macosx --minimum-deployment-target "$MACOS_MIN" \
+  --app-icon AppIcon --output-partial-info-plist "$icon/partial.plist" >"$icon/actool.txt" 2>&1 || { cat "$icon/actool.txt" >&2; exit 1; }
+[[ -f "$icon/Assets.car" && -f "$icon/AppIcon.icns" ]] || { cat "$icon/actool.txt" >&2; print -u2 "actool made no icon"; exit 1; }
+cp "$icon/Assets.car" "$icon/AppIcon.icns" "$R/"
 
 xattr -cr "$APP"
 fw="$APP/Contents/Frameworks/Sparkle.framework"
